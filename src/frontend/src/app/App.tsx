@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Send, FolderSearch, CheckCircle, Loader, AlertCircle, X, RefreshCw, Wrench } from 'lucide-react';
+import logo from './logo.png';
 
 const WORKSPACE: string = (window as any).WORKSPACE_PATH || '';
 
@@ -157,21 +158,25 @@ export default function App() {
 
   return (
     <div className="size-full flex flex-col bg-[#1e1e1e] text-[#cccccc]">
-      {/* Header */}
       <div className="px-4 py-3 border-b border-[#2d2d2d] flex items-center justify-between">
-        <div>
-          <h1 className="text-sm font-semibold text-[#ffffff]">TraceBack</h1>
-          <p className="text-xs text-[#858585] mt-0.5">Incident Context Engine</p>
-        </div>
-        <div className="flex items-center gap-2">
-          {indexBadge()}
-          <button onClick={() => handleIndex()} disabled={indexState === 'indexing' || !WORKSPACE}
-            title="Re-index workspace"
-            className="p-1.5 rounded hover:bg-[#2d2d2d] disabled:opacity-40 text-[#858585] hover:text-[#cccccc] transition-colors">
-            <FolderSearch className="w-4 h-4" />
-          </button>
-        </div>
+    <div>
+      {/* Flex container to align title and logo horizontally */}
+      <div className="flex items-center gap-2">
+        <h1 className="text-sm font-semibold text-[#ffffff]">TraceBack</h1>
+        <img src={logo} alt="Logo" className="w-5 h-5" />
       </div>
+      <p className="text-xs text-[#858585] mt-0.5">Incident Context Engine</p>
+    </div>
+    
+    <div className="flex items-center gap-2">
+      {indexBadge()}
+      <button onClick={() => handleIndex()} disabled={indexState === 'indexing' || !WORKSPACE}
+        title="Re-index workspace"
+        className="p-1.5 rounded hover:bg-[#2d2d2d] disabled:opacity-40 text-[#858585] hover:text-[#cccccc] transition-colors">
+        <FolderSearch className="w-4 h-4" />
+      </button>
+    </div>
+  </div>
 
       {/* Captured error banner */}
       {capturedError && (
