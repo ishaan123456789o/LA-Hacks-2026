@@ -1,9 +1,21 @@
 .env
+.env.local
+.env.*.local
 
+# System files
+.DS_Store
+Thumbs.db
 
 #dependencies
-/node_modules
+node_modules/
 jspm/packages/
+package-lock.json
+
+# Build outputs
+dist/
+out/
+build/
+*.vsix
 
 # TypeScript/Build Output
 out/
@@ -24,6 +36,14 @@ ENV/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
 
 # Distribution / Packaging
 build/
@@ -54,3 +74,5 @@ Thumbs.db
 # Database / Secrets
 .python-version
 .supabase/
+__pycache__/
+*.pyc
