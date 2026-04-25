@@ -25,7 +25,17 @@
         "traceback.pythonPath": {
           "type": "string",
           "default": "python3",
-          "description": "Path to the Python executable with uagents/fastapi installed (e.g. /Users/you/miniconda3/bin/python)"
+          "description": "Path to the Python executable with uagents/fastapi installed (e.g. /Users/you/miniconda3/bin/python). Only used in local mode."
+        },
+        "traceback.bridgeUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Hosted bridge URL (e.g. https://my-traceback.fly.dev). Leave empty to run the bridge locally as a subprocess. When set, no Python process is spawned and API keys stay server-side."
+        },
+        "traceback.bridgePort": {
+          "type": "number",
+          "default": 8080,
+          "description": "Local bridge port (default 8080). Only used when traceback.bridgeUrl is empty."
         }
       }
     }
