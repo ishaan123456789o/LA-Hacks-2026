@@ -74,3 +74,5 @@ Thumbs.db
 # Database / Secrets
 .python-version
 .supabase/
+__pycache__/
+*.pyc
