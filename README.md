@@ -1,72 +1,71 @@
-# CodeCartographer
+# TraceBack
 
-CodeCartographer is a context retrieval engine designed to improve how large language models and autonomous coding agents interact with enterprise codebases. It uses a multi-agent architecture to parse, trace, and index repositories into a semantic graph, allowing for precise, function-level code retrieval.
+TraceBack is a context retrieval engine designed to accelerate incident response and bug triage. Built as a native VS Code extension, it utilizes a multi-agent orchestration framework to parse, trace, and index repositories into a semantic graph, allowing developers to instantly map raw error logs to the specific functions causing the crash.
 
 ## The Problem
 
-As developers increasingly rely on AI coding agents (such as Devin, Claude, or GitHub Copilot) to navigate and modify codebases, a significant bottleneck has emerged: **context management**. 
+When managing Agile backlogs and triaging production issues at scale, the primary bottleneck is rarely writing the fix—it is the hours spent context-switching and hunting for the broken dependency. 
 
-The standard approach to giving an AI context is to load entire files, or even entire repositories, into the model's context window. This creates several critical failures:
-1. **Context Window Exhaustion & Cost:** Passing thousands of lines of irrelevant boilerplate, CSS, or dependency lockfiles wastes tokens and significantly increases API costs.
-2. **Behavioral Drift (Hallucinations):** When an LLM is fed a low signal-to-noise ratio, its attention mechanism struggles. It loses track of the primary objective and is more likely to hallucinate logic or generate code that violates established repository patterns.
-3. **Broken Dependency Tracing:** Naive text chunking or simple `grep` searches fail to capture cross-file dependencies. If a function in `main.py` relies on a utility in `auth.py`, standard chunking often drops the necessary context.
+Furthermore, as developers increasingly rely on AI coding agents (such as Devin or GitHub Copilot) to resolve these bugs, a critical failure point emerges: **context exhaustion**. Dumping an entire repository or raw stack trace into an LLM's context window leads to:
+1. **Behavioral Drift (Hallucinations):** The AI loses focus amid boilerplate code and suggests fixes that violate repository patterns.
+2. **Token Waste:** Processing irrelevant dependencies is slow and expensive.
+3. **Broken Dependency Tracing:** Naive RAG implementations fail to capture complex, cross-file import relationships.
 
 ## The Solution
 
-CodeCartographer replaces naive file-dumping with a precise Retrieval-Augmented Generation (RAG) pipeline built specifically for code. 
+TraceBack serves as an automated Incident Context Engine. Instead of treating debugging as a manual search or a brute-force AI prompt, TraceBack acts as a precision middleware.
 
-Instead of reading the entire repository, the AI agent (or human developer) queries CodeCartographer with a specific task (e.g., "Retrieve the functions responsible for the user authentication flow"). The system bypasses the boilerplate and returns only the specific functional blocks and their associated dependencies required to complete the task.
+A developer pastes a raw error log into the VS Code sidebar. Behind the scenes, a swarm of agents processes the stack trace against a pre-indexed vector map of the repository. TraceBack instantly returns an "Incident Context Kit"—the exact chain of files and functional blocks responsible for the crash. This hands the developer (or an autonomous AI agent) the high-signal, zero-noise context required to write the fix immediately.
 
-## Architecture
+## Architecture & Agent Swarm
 
-The system operates using a multi-agent orchestration framework built on Fetch.ai's `uagents` library. 
+The system operates using a decentralized, multi-agent framework built on Fetch.ai's `uagents` library, communicating with a React-based VS Code Webview.
 
 1. **Parser Agent (Data Extraction)**
    - Ingests the target repository.
-   - Uses Abstract Syntax Tree (AST) parsing to break the codebase down into logical, discrete blocks (classes, functions, and variables) rather than arbitrary text chunks.
+   - Utilizes Abstract Syntax Tree (AST) parsing to break the codebase down into discrete logical blocks (classes, functions, and variables).
 
 2. **Tracer Agent (Graph Building & Embedding)**
-   - Analyzes the output from the Parser to map cross-file import relationships and execution flows.
-   - Passes these structural chunks through an embedding model (OpenAI `text-embedding-ada-002`).
-   - Stores the embeddings and metadata in a Supabase database utilizing the `pgvector` extension.
+   - Analyzes the parser's output to map cross-file dependencies and execution flows.
+   - Embeds these structural chunks using an embedding model and stores them in a Supabase database utilizing the `pgvector` extension.
 
-3. **Librarian Agent (Retrieval API)**
-   - Serves as the interface for the frontend or external AI agents.
-   - Receives natural language queries, embeds the query, and performs a cosine similarity search against the Supabase vector database.
-   - Returns the top relevant code blocks and their traced dependencies.
+3. **Triage Librarian Agent (Retrieval API)**
+   - Interfaces directly with the VS Code extension.
+   - Receives raw error logs, extracts failing function names/files, and performs a cosine similarity search against the Supabase vector database.
+   - Returns the verified dependency chain back to the IDE sidebar.
 
 ## Hackathon Tracks (LA Hacks)
 
-* **Cognition:** Provides an infrastructure solution to the context bottleneck for autonomous agents, ensuring they operate with high-signal data.
-* **Fetch.ai:** The core backend leverages the Agentverse platform and `uagents` framework to handle asynchronous parsing and retrieval tasks.
-* **Figma:** The frontend dashboard UI was rapidly prototyped and structurally validated using Figma Make before React implementation.
+* **Cognition:** Acts as a pre-processing infrastructure layer for autonomous AI agents, ensuring they receive verified, hyper-specific context before attempting bug resolution.
+* **Fetch.ai:** The core backend leverages the Agentverse platform and `uagents` framework to distribute parsing, embedding, and retrieval across distinct micro-agents.
+* **Figma Make:** The extension's sidebar layout, including the error input and code block displays, was rapidly prototyped and structurally validated using Figma Make before React implementation.
 
 ## Tech Stack
 
+* **Extension Host:** VS Code Extension API
+* **Frontend:** React.js / TailwindCSS (rendered via VS Code Webview)
 * **Agent Framework:** Fetch.ai `uagents` (Python)
-* **Parsing:** Python `ast` / Tree-sitter
+* **Parsing:** Python `ast`
 * **Vector Database:** Supabase (`pgvector`)
-* **Embeddings:** OpenAI API
-* **Frontend:** React.js, TailwindCSS
-* **Design:** Figma Make
+* **Design Prototyping:** Figma Make
 
 ## Getting Started
 
 ### Prerequisites
-* Python 3.10+
 * Node.js & npm
+* Python 3.10+
 * Supabase Account
-* OpenAI API Key
+* VS Code Extension Manager (`vsce`)
 
 ### 1. Installation
 ```bash
-git clone [https://github.com/yourusername/CodeCartographer.git](https://github.com/yourusername/CodeCartographer.git)
-cd CodeCartographer
+git clone [https://github.com/yourusername/TraceBack.git](https://github.com/yourusername/TraceBack.git)
+cd TraceBack
+
+# Install VS Code Extension & Webview dependencies
+cd extension
+npm install
 
 # Install Python backend dependencies
-cd backend
+cd ../backend
 pip install -r requirements.txt
-
-# Install React frontend dependencies
-cd ../frontend
-npm install
