@@ -1,4 +1,13 @@
--- Run once in your Supabase SQL editor
+-- TraceBack canonical Supabase schema
+-- Run once in your Supabase SQL editor (Dashboard → SQL Editor → New Query).
+--
+-- CANONICAL EMBEDDING DIMENSION: 768
+--   Gemini  → GEMINI_EMBEDDING_MODEL=models/text-embedding-004  (native 768-dim)
+--             Experimental 3072-dim models are auto-truncated via outputDimensionality=768.
+--   OpenAI  → text-embedding-3-small with dimensions=768
+--
+-- If you need a different dimension, change every vector(768) below to vector(N),
+-- set EMBEDDING_DIM=N in your .env, and run POST /index to reindex everything.
 
 create extension if not exists vector;
 
@@ -8,7 +17,7 @@ create table if not exists code_chunks (
   file_path     text,
   function_name text,
   raw_code      text,
-  embedding     vector(768)
+  embedding     vector(768)   -- must match SCHEMA_EMBEDDING_DIM in agents/bridge.py
 );
 
 create index if not exists code_chunks_embedding_idx
@@ -16,7 +25,7 @@ create index if not exists code_chunks_embedding_idx
   with (lists = 100);
 
 create or replace function match_code_chunks(
-  query_embedding vector(768),
+  query_embedding vector(768),   -- must match table column dimension
   match_count     int default 5
 )
 returns table (

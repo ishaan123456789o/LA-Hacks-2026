@@ -39,11 +39,14 @@ const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const http = __importStar(require("http"));
+const https = __importStar(require("https"));
 const child_process_1 = require("child_process");
-const BRIDGE_PORT = 8080;
+const DEFAULT_BRIDGE_PORT = 8080;
 let bridgeProcess;
 let activePanel;
 let latestCapturedError;
+// Resolved at activation — either a hosted URL or the local 127.0.0.1 address.
+let resolvedBridgeUrl = `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}`;
 // ── ANSI / terminal helpers ────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*[mGKHFJA-Z]/g;
 function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
@@ -52,15 +55,29 @@ const TRACEBACK_RE = /Traceback \(most recent call last\)[\s\S]+?[\w.]+(?:Error|
 function postToPanel(msg) {
     activePanel?.webview.postMessage(msg);
 }
-// ── Bridge proxy: extension host → bridge HTTP ────────────────────────────
+// ── Bridge proxy: extension host → bridge HTTP/HTTPS ─────────────────────
 // The webview cannot reliably reach localhost directly (sandbox, IPv6, remote
 // VS Code). All bridge calls are routed through the extension host instead.
+// Supports both local (http://127.0.0.1) and hosted (https://...) bridges.
 function handleBridgeCall(id, method, urlPath, body, output) {
     const payload = (method !== 'GET' && body) ? JSON.stringify(body) : '';
-    const req = http.request({
-        hostname: '127.0.0.1',
-        port: BRIDGE_PORT,
-        path: urlPath,
+    let base;
+    try {
+        base = new URL(resolvedBridgeUrl);
+    }
+    catch {
+        postToPanel({ type: 'bridge-response', id, ok: false, error: `Invalid bridgeUrl: ${resolvedBridgeUrl}` });
+        return;
+    }
+    const isHttps = base.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const port = base.port ? Number(base.port) : (isHttps ? 443 : 80);
+    // Strip trailing slash from pathname so urlPath (which starts with /) works cleanly.
+    const fullPath = base.pathname.replace(/\/$/, '') + urlPath;
+    const req = mod.request({
+        hostname: base.hostname,
+        port,
+        path: fullPath,
         method: method.toUpperCase(),
         headers: payload
             ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
@@ -77,7 +94,7 @@ function handleBridgeCall(id, method, urlPath, body, output) {
                     id,
                     ok,
                     data: ok ? parsed : undefined,
-                    error: !ok ? (parsed.detail ?? JSON.stringify(parsed)) : undefined,
+                    error: !ok ? _friendlyBridgeError(res.statusCode ?? 500, parsed) : undefined,
                 });
             }
             catch {
@@ -87,11 +104,28 @@ function handleBridgeCall(id, method, urlPath, body, output) {
     });
     req.on('error', (e) => {
         output.appendLine(`[Bridge] ${method} ${urlPath} failed: ${e.message}`);
-        postToPanel({ type: 'bridge-response', id, ok: false, error: `Bridge unreachable: ${e.message}` });
+        const isLocal = resolvedBridgeUrl.includes('127.0.0.1') || resolvedBridgeUrl.includes('localhost');
+        const hint = isLocal
+            ? ' — is the bridge process running? Check the TraceBack output channel.'
+            : ` — check that ${resolvedBridgeUrl} is reachable.`;
+        postToPanel({ type: 'bridge-response', id, ok: false, error: `Bridge unreachable: ${e.message}${hint}` });
     });
     if (payload)
         req.write(payload);
     req.end();
+}
+function _friendlyBridgeError(statusCode, parsed) {
+    const detail = parsed?.detail ?? JSON.stringify(parsed);
+    if (statusCode === 401) {
+        return `Auth error (401): ${detail}`;
+    }
+    if (statusCode === 422) {
+        return `Dimension mismatch (422): ${detail}`;
+    }
+    if (statusCode === 503) {
+        return `RPC not found (503): ${detail}`;
+    }
+    return detail;
 }
 // ── Fire-and-forget bridge call (file watcher / internal use) ─────────────
 function callBridgePost(urlPath, body, output) {
@@ -194,20 +228,34 @@ function setupTerminalErrorCapture(context, output) {
 function activate(context) {
     const output = vscode.window.createOutputChannel('TraceBack');
     context.subscriptions.push(output);
-    startBridge(context, output);
+    const config = vscode.workspace.getConfiguration('traceback');
+    const hostedUrl = config.get('bridgeUrl', '').trim();
+    if (hostedUrl) {
+        // Hosted mode: use a remote bridge — no subprocess needed.
+        // Secrets (API keys) live on the server; only the URL is needed here.
+        resolvedBridgeUrl = hostedUrl.replace(/\/$/, '');
+        output.appendLine(`[TraceBack] Hosted mode — bridge: ${resolvedBridgeUrl}`);
+    }
+    else {
+        // Local mode: spawn bridge.py subprocess on localhost.
+        const port = config.get('bridgePort', DEFAULT_BRIDGE_PORT);
+        resolvedBridgeUrl = `http://127.0.0.1:${port}`;
+        output.appendLine(`[TraceBack] Local mode — bridge: ${resolvedBridgeUrl}`);
+        startBridge(context, output, port);
+    }
     setupFileWatcher(context, output);
     setupTerminalErrorCapture(context, output);
     context.subscriptions.push(vscode.commands.registerCommand('traceback.open', () => openPanel(context, output)));
     openPanel(context, output);
 }
-function startBridge(context, output) {
+function startBridge(context, output, port) {
     const config = vscode.workspace.getConfiguration('traceback');
     const pythonPath = config.get('pythonPath', 'python3');
     const bridgePath = path.join(context.extensionPath, 'agents', 'bridge.py');
     output.appendLine(`[TraceBack] Starting bridge with ${pythonPath} ${bridgePath}`);
     bridgeProcess = (0, child_process_1.spawn)(pythonPath, [bridgePath], {
         cwd: context.extensionPath,
-        env: { ...process.env },
+        env: { ...process.env, BRIDGE_PORT: String(port) },
     });
     bridgeProcess.stdout?.on('data', (d) => output.appendLine(d.toString().trim()));
     bridgeProcess.stderr?.on('data', (d) => output.appendLine('[ERR] ' + d.toString().trim()));
@@ -261,7 +309,7 @@ pnpm build</pre>
     html = html.replace(/(src|href)="(\.\/[^"]+)"/g, (_m, attr, p) => `${attr}="${distUri}/${p.slice(2)}"`);
     html = html.replace(/(src|href)="(\/assets\/[^"]+)"/g, (_m, attr, p) => `${attr}="${distUri}${p}"`);
     // No connect-src needed — all bridge calls go through the extension host,
-    // not direct from the webview. This works locally, remotely, and in Codespaces.
+    // not direct from the webview. Works locally, remotely, and in Codespaces.
     const csp = [
         `default-src 'none'`,
         `script-src 'unsafe-eval' 'unsafe-inline' ${webview.cspSource}`,
