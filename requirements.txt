@@ -2,3 +2,6 @@ uagents==0.24
 openai
 supabase
 python-dotenv
+
+#frontend packages/dependencies needed
+npm install react @radix-ui/react-slot class-variance-authority clsx tailwind-merge
