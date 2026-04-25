@@ -620,6 +620,12 @@ def fix_code(req: FixRequest):
         for m in matches
     )
 
+    # Keyed by (file_path, function_name) so we can resolve old_code exactly
+    # without relying on the LLM to reproduce verbatim text.
+    chunk_lookup: Dict[tuple, str] = {
+        (m["file_path"], m["function_name"]): m["raw_code"] for m in matches
+    }
+
     try:
         response = _get_asi1().chat.completions.create(
             model="asi1",
@@ -631,8 +637,8 @@ def fix_code(req: FixRequest):
                         "Given an error log and the relevant code blocks, return ONLY a JSON array of edits. "
                         "Each edit must be an object with exactly three string fields: "
                         '"file_path" (absolute path as shown above), '
-                        '"old_code" (the exact verbatim lines to replace, copied from the code block), '
-                        '"new_code" (the fixed replacement). '
+                        '"function_name" (exact function name as shown above), '
+                        '"new_code" (the complete fixed replacement for that function, preserving indentation exactly). '
                         "Return raw JSON only — no markdown fences, no prose, no explanation."
                     ),
                 },
@@ -652,7 +658,27 @@ def fix_code(req: FixRequest):
         edits = json.loads(raw)
         if not isinstance(edits, list):
             edits = [edits]
-        return {"edits": edits}
+
+        # Resolve old_code from the exact stored source — never trust LLM for verbatim text
+        full_edits = []
+        for edit in edits:
+            fp = edit.get("file_path", "")
+            fn = edit.get("function_name", "")
+            new_code = edit.get("new_code", "")
+            if not fp or not new_code:
+                continue
+            old_code = chunk_lookup.get((fp, fn))
+            if old_code is None:
+                for (cfp, cfn), code in chunk_lookup.items():
+                    if cfp == fp and cfn.lower() == fn.lower():
+                        old_code = code
+                        break
+            if old_code is None:
+                print(f"[Bridge] Fix: could not find {fn!r} in {fp!r}", flush=True)
+                continue
+            full_edits.append({"file_path": fp, "old_code": old_code, "new_code": new_code})
+
+        return {"edits": full_edits}
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"LLM returned non-JSON: {e}")
     except Exception as e:
