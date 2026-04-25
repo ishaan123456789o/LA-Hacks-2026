@@ -3,3 +3,5 @@ openai
 supabase
 python-dotenv
 certifi
+fastapi
+uvicorn[standard]

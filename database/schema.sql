@@ -8,7 +8,7 @@ create table if not exists code_chunks (
   file_path     text,
   function_name text,
   raw_code      text,
-  embedding     vector(1536)
+  embedding     vector(768)
 );
 
 create index if not exists code_chunks_embedding_idx
@@ -16,7 +16,7 @@ create index if not exists code_chunks_embedding_idx
   with (lists = 100);
 
 create or replace function match_code_chunks(
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count     int default 5
 )
 returns table (
