@@ -4,9 +4,7 @@ from dataclasses import dataclass, asdict
 from typing import List
 
 
-# =========================
-# Data मॉडल (Protocol Match)
-# =========================
+
 @dataclass
 class CodeChunk:
     file_path: str
