@@ -4,4 +4,5 @@ supabase
 python-dotenv
 certifi
 fastapi
+fastapi
 uvicorn[standard]

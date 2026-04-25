@@ -12,6 +12,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,25 +50,92 @@ app.add_middleware(
 
 # ── Embedding ──────────────────────────────────────────────────────────────
 
+DEFAULT_GEMINI_EMBEDDING_MODELS = ("models/embedding-001", "models/text-embedding-004")
+TARGET_VECTOR_DIM = int(os.getenv("TARGET_VECTOR_DIM", "768"))
+
+
+def _normalize_vector(vector: list, target_dim: int = TARGET_VECTOR_DIM) -> list:
+    values = list(vector)
+    if len(values) == target_dim:
+        return values
+    if len(values) > target_dim:
+        return values[:target_dim]
+    return values + [0.0] * (target_dim - len(values))
+
+
+def _gemini_request(url: str, body: dict | None, method: str = "POST") -> dict:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as err:
+        details = err.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Gemini request failed: {err.code} {details}") from err
+
+
+def _discover_gemini_embedding_models(key: str) -> List[str]:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+    try:
+        payload = _gemini_request(url=url, body=None, method="GET")
+    except RuntimeError:
+        return []
+
+    models: List[str] = []
+    for item in payload.get("models", []):
+        name = item.get("name")
+        supported = item.get("supportedGenerationMethods", [])
+        if name and "embedContent" in supported:
+            models.append(name)
+    return models
+
+
+def _gemini_embed(text: str, key: str) -> list:
+    configured_model = os.getenv("GEMINI_EMBEDDING_MODEL")
+    candidate_models: List[str] = []
+    if configured_model:
+        candidate_models.append(configured_model)
+    candidate_models.extend(DEFAULT_GEMINI_EMBEDDING_MODELS)
+    candidate_models.extend(_discover_gemini_embedding_models(key))
+    candidate_models = list(dict.fromkeys(candidate_models))
+
+    last_error: Exception | None = None
+    for model in candidate_models:
+        normalized = model if model.startswith("models/") else f"models/{model}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{normalized}:embedContent?key={key}"
+        body = {"model": normalized, "content": {"parts": [{"text": text}]}}
+        try:
+            payload = _gemini_request(url=url, body=body)
+        except RuntimeError as err:
+            last_error = err
+            continue
+
+        values = payload.get("embedding", {}).get("values")
+        if values:
+            return values
+        last_error = RuntimeError(f"Gemini embedding response missing values for {normalized}")
+
+    raise RuntimeError(
+        "Gemini embedding failed for all candidate models. "
+        "Set GEMINI_EMBEDDING_MODEL to a model that supports embedContent."
+    ) from last_error
+
+
 def embed_text(text: str) -> list:
     provider = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
     if provider == "gemini":
         key = os.environ["GEMINI_API_KEY"]
-        model = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
-        if not model.startswith("models/"):
-            model = f"models/{model}"
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model}:embedContent?key={key}"
-        body = {"model": model, "content": {"parts": [{"text": text}]}}
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
-        )
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-            return json.loads(resp.read())["embedding"]["values"]
+        return _normalize_vector(_gemini_embed(text=text, key=key))
     else:
         client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         resp = client.embeddings.create(model="text-embedding-3-small", input=text)
-        return resp.data[0].embedding
+        return _normalize_vector(resp.data[0].embedding)
 
 
 # ── AST repo parser ────────────────────────────────────────────────────────

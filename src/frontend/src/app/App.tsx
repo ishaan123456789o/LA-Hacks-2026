@@ -196,6 +196,25 @@ export default function App() {
           className="w-full h-32 px-3 py-2 bg-[#252526] border border-[#3c3c3c] rounded text-sm font-mono text-[#cccccc] placeholder-[#6a6a6a] focus:outline-none focus:border-[#007acc] resize-none" />
 
         <div className="mt-3 flex gap-2">
+          <button
+            onClick={() => handleIndex()}
+            disabled={indexState === 'indexing' || !WORKSPACE}
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-[#2d2d2d] hover:bg-[#3a3a3a] disabled:bg-[#252526] disabled:text-[#6a6a6a] text-[#cccccc] text-sm font-medium rounded transition-colors"
+            title={WORKSPACE ? 'Index current workspace' : 'Open a folder in Extension Host first'}
+          >
+            {indexState === 'indexing' ? (
+              <>
+                <Loader className="w-4 h-4 animate-spin" />
+                Indexing...
+              </>
+            ) : (
+              <>
+                <FolderSearch className="w-4 h-4" />
+                Index Workspace
+              </>
+            )}
+          </button>
+
           <button onClick={handleAnalyze} disabled={!errorLog.trim() || isAnalyzing}
             className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-[#0e639c] hover:bg-[#1177bb] disabled:bg-[#2d2d2d] disabled:text-[#6a6a6a] text-white text-sm font-medium rounded transition-colors">
             {isAnalyzing ? <><Loader className="w-4 h-4 animate-spin" />Analyzing...</> : <><Send className="w-4 h-4" />Analyze</>}
@@ -211,6 +230,7 @@ export default function App() {
 
         {fixState === 'done'  && <p className="mt-2 text-xs text-[#4ec9b0] flex items-center gap-1"><CheckCircle className="w-3 h-3" />{fixSummary}</p>}
         {fixState === 'error' && <p className="mt-2 text-xs text-[#f44747] flex items-center gap-1"><AlertCircle className="w-3 h-3" />{fixSummary || 'Fix could not be applied'}</p>}
+        {indexState === 'error' && <p className="mt-2 text-xs text-[#f44747] flex items-center gap-1"><AlertCircle className="w-3 h-3" />{indexError || 'Indexing failed'}</p>}
       </div>
 
       {/* Output */}
