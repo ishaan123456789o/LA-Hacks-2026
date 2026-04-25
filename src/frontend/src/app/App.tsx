@@ -1,19 +1,54 @@
 import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { Send, FolderSearch, CheckCircle, Loader } from 'lucide-react';
+import { Send, FolderSearch, CheckCircle, Loader, AlertCircle, X, RefreshCw, Wrench } from 'lucide-react';
 
 const BRIDGE = `http://localhost:${(window as any).BRIDGE_PORT || 8080}`;
 const WORKSPACE: string = (window as any).WORKSPACE_PATH || '';
 
+// Acquire VS Code API once — throws if called more than once, so module-level singleton.
+const vscodeApi = (() => {
+  try { return (window as any).acquireVsCodeApi?.(); }
+  catch { return undefined; }
+})();
+
 type IndexState = 'idle' | 'indexing' | 'done' | 'error';
+type FixState = 'idle' | 'generating' | 'applying' | 'done' | 'error';
 
 export default function App() {
-  const [errorLog, setErrorLog] = useState('');
+  const [errorLog, setErrorLog] = useState<string>((window as any).INITIAL_ERROR || '');
   const [analysisResult, setAnalysisResult] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [indexState, setIndexState] = useState<IndexState>('idle');
   const [indexedChunks, setIndexedChunks] = useState(0);
   const [indexError, setIndexError] = useState('');
+  const [capturedError, setCapturedError] = useState('');
+  const [reindexingFile, setReindexingFile] = useState('');
+  const [fixState, setFixState] = useState<FixState>('idle');
+  const [fixSummary, setFixSummary] = useState('');
+
+  // Messages from the VS Code extension
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      const msg = event.data;
+      if (!msg?.type) return;
+      if (msg.type === 'error-captured') {
+        setCapturedError(msg.data as string);
+      } else if (msg.type === 'reindex-start') {
+        setReindexingFile(msg.file as string);
+        setTimeout(() => setReindexingFile(''), 3000);
+      } else if (msg.type === 'fix-result') {
+        const { applied, total } = msg as { applied: number; total: number };
+        setFixState(applied > 0 ? 'done' : 'error');
+        setFixSummary(
+          applied === total
+            ? `${applied} edit${applied !== 1 ? 's' : ''} applied`
+            : `${applied}/${total} edits applied`
+        );
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
 
   useEffect(() => {
     fetch(`${BRIDGE}/status`)
@@ -55,6 +90,8 @@ export default function App() {
     if (!errorLog.trim()) return;
     setIsAnalyzing(true);
     setAnalysisResult('');
+    setFixState('idle');
+    setFixSummary('');
     try {
       const res = await fetch(`${BRIDGE}/analyze`, {
         method: 'POST',
@@ -71,7 +108,40 @@ export default function App() {
     }
   };
 
+  const handleApplyFix = async () => {
+    if (!errorLog.trim() || !vscodeApi) return;
+    setFixState('generating');
+    setFixSummary('');
+    try {
+      const res = await fetch(`${BRIDGE}/fix`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error_log: errorLog }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Fix generation failed');
+      if (!data.edits?.length) {
+        setFixState('error');
+        setFixSummary('No edits returned by model');
+        return;
+      }
+      setFixState('applying');
+      vscodeApi.postMessage({ type: 'apply-fix', edits: data.edits });
+      // fix-result message from extension will update fixState
+    } catch (e: any) {
+      setFixState('error');
+      setFixSummary((e as Error).message);
+    }
+  };
+
+  const useCapturedError = () => {
+    setErrorLog(capturedError);
+    setCapturedError('');
+  };
+
   const indexBadge = () => {
+    if (reindexingFile)
+      return <span className="flex items-center gap-1 text-[10px] text-[#cca700]"><RefreshCw className="w-3 h-3 animate-spin" />{reindexingFile}</span>;
     if (indexState === 'indexing')
       return <span className="flex items-center gap-1 text-[10px] text-[#cca700]"><Loader className="w-3 h-3 animate-spin" />Indexing...</span>;
     if (indexState === 'done')
@@ -79,6 +149,12 @@ export default function App() {
     if (indexState === 'error')
       return <span className="text-[10px] text-[#f44747]" title={indexError}>Index error — retry</span>;
     return null;
+  };
+
+  const fixButtonContent = () => {
+    if (fixState === 'generating') return <><Loader className="w-4 h-4 animate-spin" />Generating fix...</>;
+    if (fixState === 'applying')  return <><Loader className="w-4 h-4 animate-spin" />Applying...</>;
+    return <><Wrench className="w-4 h-4" />Apply Fix</>;
   };
 
   return (
@@ -102,28 +178,64 @@ export default function App() {
         </div>
       </div>
 
+      {/* Captured error banner */}
+      {capturedError && (
+        <div className="mx-4 mt-3 px-3 py-2 bg-[#2d1a1a] border border-[#6b2d2d] rounded flex items-center gap-2">
+          <AlertCircle className="w-3.5 h-3.5 text-[#f44747] shrink-0" />
+          <span className="flex-1 text-xs text-[#f44747] font-medium">Error captured from terminal</span>
+          <button
+            onClick={useCapturedError}
+            className="text-[10px] px-2 py-1 bg-[#3c2424] hover:bg-[#4a2c2c] text-[#f88080] rounded transition-colors"
+          >
+            Use it
+          </button>
+          <button onClick={() => setCapturedError('')} className="text-[#858585] hover:text-[#cccccc] transition-colors" title="Dismiss">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Input */}
       <div className="px-4 py-4 border-b border-[#2d2d2d]">
-        <label className="block text-xs font-medium mb-2 text-[#ffffff]">
-          Paste Error Log
-        </label>
+        <label className="block text-xs font-medium mb-2 text-[#ffffff]">Paste Error Log</label>
         <textarea
           value={errorLog}
           onChange={(e) => setErrorLog(e.target.value)}
-          placeholder="Paste your stack trace or error log here..."
+          placeholder="Paste your stack trace or error log here... (errors from terminal are captured automatically)"
           className="w-full h-32 px-3 py-2 bg-[#252526] border border-[#3c3c3c] rounded text-sm font-mono text-[#cccccc] placeholder-[#6a6a6a] focus:outline-none focus:border-[#007acc] resize-none"
         />
-        <button
-          onClick={handleAnalyze}
-          disabled={!errorLog.trim() || isAnalyzing}
-          className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2 bg-[#0e639c] hover:bg-[#1177bb] disabled:bg-[#2d2d2d] disabled:text-[#6a6a6a] text-white text-sm font-medium rounded transition-colors"
-        >
-          {isAnalyzing ? (
-            <><Loader className="w-4 h-4 animate-spin" />Analyzing...</>
-          ) : (
-            <><Send className="w-4 h-4" />Analyze Trace</>
+        <div className="mt-3 flex gap-2">
+          <button
+            onClick={handleAnalyze}
+            disabled={!errorLog.trim() || isAnalyzing}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-[#0e639c] hover:bg-[#1177bb] disabled:bg-[#2d2d2d] disabled:text-[#6a6a6a] text-white text-sm font-medium rounded transition-colors"
+          >
+            {isAnalyzing ? <><Loader className="w-4 h-4 animate-spin" />Analyzing...</> : <><Send className="w-4 h-4" />Analyze</>}
+          </button>
+
+          {/* Apply Fix — only shown when there's an analysis result and we're running inside VS Code */}
+          {analysisResult && vscodeApi && (
+            <button
+              onClick={handleApplyFix}
+              disabled={fixState === 'generating' || fixState === 'applying'}
+              className="flex items-center justify-center gap-2 px-4 py-2 bg-[#1e4d1e] hover:bg-[#256325] disabled:bg-[#2d2d2d] disabled:text-[#6a6a6a] text-[#4ec9b0] text-sm font-medium rounded transition-colors"
+            >
+              {fixButtonContent()}
+            </button>
           )}
-        </button>
+        </div>
+
+        {/* Fix result status */}
+        {fixState === 'done' && (
+          <p className="mt-2 text-xs text-[#4ec9b0] flex items-center gap-1">
+            <CheckCircle className="w-3 h-3" />{fixSummary}
+          </p>
+        )}
+        {fixState === 'error' && (
+          <p className="mt-2 text-xs text-[#f44747] flex items-center gap-1">
+            <AlertCircle className="w-3 h-3" />{fixSummary || 'Fix could not be applied'}
+          </p>
+        )}
       </div>
 
       {/* Output */}
@@ -156,7 +268,7 @@ export default function App() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
             <p className="text-sm">No analysis yet</p>
-            <p className="text-xs mt-1">Paste an error log above to get started</p>
+            <p className="text-xs mt-1">Paste an error log above, or run your code — errors are captured automatically</p>
           </div>
         )}
       </div>

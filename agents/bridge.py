@@ -6,6 +6,7 @@ import ast
 import atexit
 import json
 import os
+import re
 import signal
 import ssl
 import subprocess
@@ -78,6 +79,21 @@ class _Chunk:
     raw_code: str
 
 
+def _parse_file(file_path: str) -> List[_Chunk]:
+    chunks: List[_Chunk] = []
+    try:
+        src = open(file_path, encoding="utf-8").read()
+        tree = ast.parse(src)
+        lines = src.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                raw = "\n".join(lines[node.lineno - 1: node.end_lineno])
+                chunks.append(_Chunk(file_path, node.name, raw))
+    except Exception:
+        pass
+    return chunks
+
+
 def _parse_repo(repo_path: str) -> List[_Chunk]:
     chunks: List[_Chunk] = []
     skip = {"venv", ".venv", "__pycache__", ".git", "node_modules", "dist", "build"}
@@ -86,17 +102,7 @@ def _parse_repo(repo_path: str) -> List[_Chunk]:
         for fname in files:
             if not fname.endswith(".py"):
                 continue
-            fpath = os.path.join(root, fname)
-            try:
-                src = open(fpath, encoding="utf-8").read()
-                tree = ast.parse(src)
-                lines = src.splitlines()
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        raw = "\n".join(lines[node.lineno - 1: node.end_lineno])
-                        chunks.append(_Chunk(fpath, node.name, raw))
-            except Exception:
-                pass
+            chunks.extend(_parse_file(os.path.join(root, fname)))
     return chunks
 
 
@@ -145,6 +151,14 @@ class IndexRequest(BaseModel):
     repo_path: str
 
 
+class ReindexFileRequest(BaseModel):
+    file_path: str
+
+
+class FixRequest(BaseModel):
+    error_log: str
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/status")
@@ -161,6 +175,12 @@ def index_repo(req: IndexRequest):
     chunks = _parse_repo(req.repo_path)
     if not chunks:
         return {"status": "ok", "chunks": 0}
+
+    # Remove stale chunks before re-indexing to avoid duplicates
+    try:
+        supabase.table("code_chunks").delete().like("file_path", f"{req.repo_path}%").execute()
+    except Exception:
+        pass
 
     BATCH = 20
     total = 0
@@ -190,6 +210,46 @@ def index_repo(req: IndexRequest):
         total += len(rows)
         print(f"[Bridge] Indexed {total}/{len(chunks)} chunks", flush=True)
 
+    return {"status": "ok", "chunks": total}
+
+
+@app.post("/reindex-file")
+def reindex_file(req: ReindexFileRequest):
+    # Remove stale embeddings for this file (handles deletes too — if file is gone, parse returns [])
+    try:
+        supabase.table("code_chunks").delete().eq("file_path", req.file_path).execute()
+    except Exception:
+        pass
+
+    chunks = _parse_file(req.file_path)
+    if not chunks:
+        return {"status": "ok", "chunks": 0}
+
+    provider = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
+    BATCH = 20
+    total = 0
+    for start in range(0, len(chunks), BATCH):
+        batch = chunks[start: start + BATCH]
+        texts = [f"{c.file_path}::{c.function_name}\n{c.raw_code}" for c in batch]
+        if provider == "gemini":
+            embeddings = [embed_text(t) for t in texts]
+        else:
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            resp = client.embeddings.create(model="text-embedding-3-small", input=texts)
+            embeddings = [r.embedding for r in resp.data]
+        rows = [
+            {
+                "file_path": batch[i].file_path,
+                "function_name": batch[i].function_name,
+                "raw_code": batch[i].raw_code,
+                "embedding": embeddings[i],
+            }
+            for i in range(len(batch))
+        ]
+        supabase.table("code_chunks").insert(rows).execute()
+        total += len(rows)
+
+    print(f"[Bridge] Re-indexed {total} chunks for {req.file_path}", flush=True)
     return {"status": "ok", "chunks": total}
 
 
@@ -240,6 +300,67 @@ def analyze(req: AnalyzeRequest):
         return {"result": synthesis.choices[0].message.content}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ASI1 synthesis failed: {e}")
+
+
+@app.post("/fix")
+def fix_code(req: FixRequest):
+    try:
+        embedding = embed_text(req.error_log)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+
+    result = supabase.rpc("match_code_chunks", {
+        "query_embedding": embedding,
+        "match_count": 5,
+    }).execute()
+
+    matches = result.data or []
+    if not matches:
+        return {"edits": [], "message": "No code indexed yet."}
+
+    context_blocks = "\n\n".join(
+        f"File: {m['file_path']}\nFunction: {m['function_name']}\n```python\n{m['raw_code']}\n```"
+        for m in matches
+    )
+
+    try:
+        response = asi1_client.chat.completions.create(
+            model="asi1",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior engineer fixing a production bug. "
+                        "Given an error log and the relevant code blocks, return ONLY a JSON array of edits. "
+                        "Each edit must be an object with exactly three string fields: "
+                        '"file_path" (absolute path as shown above), '
+                        '"old_code" (the exact verbatim lines to replace, copied from the code block), '
+                        '"new_code" (the fixed replacement). '
+                        "Return raw JSON only — no markdown fences, no prose, no explanation."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Error log:\n```\n{req.error_log}\n```\n\n"
+                        f"Relevant code:\n{context_blocks}"
+                    ),
+                },
+            ],
+            max_tokens=2048,
+        )
+        raw = response.choices[0].message.content.strip()
+        # Strip accidental markdown code fences
+        raw = re.sub(r"^```[a-z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        edits = json.loads(raw)
+        if not isinstance(edits, list):
+            edits = [edits]
+        return {"edits": edits}
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"LLM returned non-JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fix generation failed: {e}")
 
 
 if __name__ == "__main__":
