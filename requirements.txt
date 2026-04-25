@@ -1,0 +1,4 @@
+uagents==0.24
+openai
+supabase
+python-dotenv
