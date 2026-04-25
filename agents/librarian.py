@@ -22,6 +22,7 @@ agent = Agent(
     endpoint=[f"http://127.0.0.1:{TRIAGE_PORT}/submit"],
     mailbox=True,
     publish_agent_details=True,
+    network="testnet",
 )
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])

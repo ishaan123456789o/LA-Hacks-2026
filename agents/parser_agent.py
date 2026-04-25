@@ -70,7 +70,9 @@ agent = Agent(
     seed=PARSER_SEED,
     port=PARSER_PORT,
     endpoint=[f"http://127.0.0.1:{PARSER_PORT}/submit"],
+    mailbox=True,
     publish_agent_details=True,
+    network="testnet",
 )
 
 parse_protocol = Protocol("ParseProtocol")
