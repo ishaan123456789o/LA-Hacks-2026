@@ -1,7 +1,12 @@
+import json
 import os
+import ssl
 import sys
+import urllib.request
 from datetime import datetime, timezone
 from uuid import uuid4
+
+import certifi
 from dotenv import load_dotenv
 from openai import OpenAI
 from supabase import create_client
@@ -25,14 +30,38 @@ agent = Agent(
     network="testnet",
 )
 
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 asi1_client = OpenAI(
     base_url="https://api.asi1.ai/v1",
     api_key=os.environ["ASI1_API_KEY"],
 )
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
+_openai_client = None
+if os.environ.get("OPENAI_API_KEY"):
+    _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
 protocol = Protocol(spec=chat_protocol_spec)
+
+
+def embed_text(text: str) -> list:
+    provider = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
+    if provider == "gemini":
+        gemini_key = os.environ["GEMINI_API_KEY"]
+        model = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
+        normalized = model if model.startswith("models/") else f"models/{model}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{normalized}:embedContent?key={gemini_key}"
+        body = {"model": normalized, "content": {"parts": [{"text": text}]}}
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload["embedding"]["values"]
+    else:
+        if not _openai_client:
+            raise ValueError("OPENAI_API_KEY required when EMBEDDING_PROVIDER=openai")
+        resp = _openai_client.embeddings.create(model="text-embedding-3-small", input=text)
+        return resp.data[0].embedding
 
 
 @protocol.on_message(ChatMessage)
@@ -44,12 +73,9 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     error_log = "".join(item.text for item in msg.content if isinstance(item, TextContent))
     ctx.logger.info(f"Triaging error log ({len(error_log)} chars)")
 
-    resp = openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=error_log,
-    )
+    embedding = embed_text(error_log)
     result = supabase.rpc("match_code_chunks", {
-        "query_embedding": resp.data[0].embedding,
+        "query_embedding": embedding,
         "match_count": 5,
     }).execute()
 
