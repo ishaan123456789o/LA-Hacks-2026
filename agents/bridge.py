@@ -365,4 +365,4 @@ def fix_code(req: FixRequest):
 
 if __name__ == "__main__":
     print(f"[Bridge] Starting on http://127.0.0.1:{BRIDGE_PORT}", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=BRIDGE_PORT, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, log_level="warning")

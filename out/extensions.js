@@ -47,33 +47,55 @@ let latestCapturedError;
 // ── ANSI / terminal helpers ────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*[mGKHFJA-Z]/g;
 function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
-// Matches a complete Python traceback ending with an error line
 const TRACEBACK_RE = /Traceback \(most recent call last\)[\s\S]+?[\w.]+(?:Error|Exception):[ \t]*.+/;
-// ── Bridge HTTP helper ─────────────────────────────────────────────────────
-function callBridgePost(urlPath, body, output) {
-    const data = JSON.stringify(body);
+// ── Post a message to the webview panel ───────────────────────────────────
+function postToPanel(msg) {
+    activePanel?.webview.postMessage(msg);
+}
+// ── Bridge proxy: extension host → bridge HTTP ────────────────────────────
+// The webview cannot reliably reach localhost directly (sandbox, IPv6, remote
+// VS Code). All bridge calls are routed through the extension host instead.
+function handleBridgeCall(id, method, urlPath, body, output) {
+    const payload = (method !== 'GET' && body) ? JSON.stringify(body) : '';
     const req = http.request({
         hostname: '127.0.0.1',
         port: BRIDGE_PORT,
         path: urlPath,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        method: method.toUpperCase(),
+        headers: payload
+            ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+            : {},
     }, res => {
         let raw = '';
         res.on('data', (chunk) => (raw += chunk.toString()));
         res.on('end', () => {
-            if (res.statusCode && res.statusCode >= 300) {
-                output.appendLine(`[Bridge] ${urlPath} → ${res.statusCode}: ${raw.slice(0, 120)}`);
+            try {
+                const parsed = JSON.parse(raw);
+                const ok = (res.statusCode ?? 500) < 300;
+                postToPanel({
+                    type: 'bridge-response',
+                    id,
+                    ok,
+                    data: ok ? parsed : undefined,
+                    error: !ok ? (parsed.detail ?? JSON.stringify(parsed)) : undefined,
+                });
+            }
+            catch {
+                postToPanel({ type: 'bridge-response', id, ok: false, error: 'Invalid response from bridge' });
             }
         });
     });
-    req.on('error', () => { }); // bridge may not be up yet — silence retry noise
-    req.write(data);
+    req.on('error', (e) => {
+        output.appendLine(`[Bridge] ${method} ${urlPath} failed: ${e.message}`);
+        postToPanel({ type: 'bridge-response', id, ok: false, error: `Bridge unreachable: ${e.message}` });
+    });
+    if (payload)
+        req.write(payload);
     req.end();
 }
-// ── Post a message to the webview panel ───────────────────────────────────
-function postToPanel(msg) {
-    activePanel?.webview.postMessage(msg);
+// ── Fire-and-forget bridge call (file watcher / internal use) ─────────────
+function callBridgePost(urlPath, body, output) {
+    handleBridgeCall('_internal', 'POST', urlPath, body, output);
 }
 async function applyFix(edits, output) {
     if (!edits || edits.length === 0) {
@@ -101,7 +123,6 @@ async function applyFix(edits, output) {
     }
     if (applied > 0) {
         await vscode.workspace.applyEdit(wsEdit);
-        // Show the first patched file in the editor
         const first = edits.find(e => {
             try {
                 vscode.Uri.file(e.file_path);
@@ -128,7 +149,6 @@ function setupFileWatcher(context, output) {
         const t = debounces.get(key);
         if (t)
             clearTimeout(t);
-        // Wait 1.5 s after the last save before hitting the bridge
         debounces.set(key, setTimeout(() => {
             debounces.delete(key);
             output.appendLine(`[TraceBack] Re-indexing ${uri.fsPath}`);
@@ -138,14 +158,11 @@ function setupFileWatcher(context, output) {
     };
     watcher.onDidChange(schedule);
     watcher.onDidCreate(schedule);
-    // Deletion: reindex-file will delete old chunks and find no new code to insert
     watcher.onDidDelete(uri => callBridgePost('/reindex-file', { file_path: uri.fsPath }, output));
     context.subscriptions.push(watcher);
     output.appendLine('[TraceBack] File watcher active (*.py)');
 }
 // ── Terminal listener: capture Python tracebacks via shell integration ────
-// Uses the stable onDidStartTerminalShellExecution API (VS Code 1.93+).
-// Falls back silently on older versions — users can still paste errors manually.
 function setupTerminalErrorCapture(context, output) {
     const event = vscode.window.onDidStartTerminalShellExecution;
     if (typeof event !== 'function') {
@@ -200,7 +217,6 @@ function startBridge(context, output) {
 function openPanel(context, output) {
     if (activePanel) {
         activePanel.reveal(vscode.ViewColumn.Beside);
-        // Re-send any buffered error to the already-open panel
         if (latestCapturedError) {
             postToPanel({ type: 'error-captured', data: latestCapturedError, source: 'terminal' });
         }
@@ -218,6 +234,9 @@ function openPanel(context, output) {
     activePanel.webview.onDidReceiveMessage(async (msg) => {
         if (msg.type === 'apply-fix') {
             await applyFix(msg.edits ?? [], output);
+        }
+        else if (msg.type === 'bridge-call') {
+            handleBridgeCall(msg.id, msg.method, msg.path, msg.body, output);
         }
     }, null, context.subscriptions);
     activePanel.onDidDispose(() => { activePanel = undefined; }, null, context.subscriptions);
@@ -241,11 +260,12 @@ pnpm build</pre>
     let html = fs.readFileSync(indexPath, 'utf8');
     html = html.replace(/(src|href)="(\.\/[^"]+)"/g, (_m, attr, p) => `${attr}="${distUri}/${p.slice(2)}"`);
     html = html.replace(/(src|href)="(\/assets\/[^"]+)"/g, (_m, attr, p) => `${attr}="${distUri}${p}"`);
+    // No connect-src needed — all bridge calls go through the extension host,
+    // not direct from the webview. This works locally, remotely, and in Codespaces.
     const csp = [
         `default-src 'none'`,
         `script-src 'unsafe-eval' 'unsafe-inline' ${webview.cspSource}`,
         `style-src 'unsafe-inline' ${webview.cspSource}`,
-        `connect-src http://localhost:${BRIDGE_PORT}`,
         `img-src ${webview.cspSource} data:`,
         `font-src ${webview.cspSource} data:`,
     ].join('; ');
@@ -253,7 +273,6 @@ pnpm build</pre>
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <script>
   window.WORKSPACE_PATH = ${JSON.stringify(workspacePath)};
-  window.BRIDGE_PORT = ${BRIDGE_PORT};
   window.INITIAL_ERROR = ${JSON.stringify(initialError)};
 </script>`;
     html = html.replace('<head>', '<head>' + injection);
