@@ -1,13 +1,9 @@
 -- TraceBack canonical Supabase schema
--- Run once in your Supabase SQL editor (Dashboard → SQL Editor → New Query).
 --
 -- CANONICAL EMBEDDING DIMENSION: 768
 --   Gemini  → GEMINI_EMBEDDING_MODEL=models/text-embedding-004  (native 768-dim)
 --             Experimental 3072-dim models are auto-truncated via outputDimensionality=768.
 --   OpenAI  → text-embedding-3-small with dimensions=768
---
--- If you need a different dimension, change every vector(768) below to vector(N),
--- set EMBEDDING_DIM=N in your .env, and run POST /index to reindex everything.
 
 create extension if not exists vector;
 
