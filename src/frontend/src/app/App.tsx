@@ -134,7 +134,7 @@ export default function App() {
       const data = await bridgeCall('POST', '/fix', { error_log: errorLog });
       if (!data.edits?.length) { setFixState('error'); setFixSummary('No edits returned by model'); return; }
       setFixState('applying');
-      vscodeApi.postMessage({ type: 'apply-fix', edits: data.edits });
+      vscodeApi.postMessage({ type: 'apply-fix', edits: data.edits, fix_request_id: data.fix_request_id });
       // fix-result message from extension updates fixState
     } catch (e: any) {
       setFixState('error');
@@ -241,18 +241,26 @@ export default function App() {
       {/* Output */}
       <div className="flex-1 overflow-auto px-4 py-4">
         {analysisResult ? (
-          <div className="prose prose-invert prose-sm max-w-none">
+          <div className="max-w-none text-sm leading-relaxed">
             <ReactMarkdown components={{
-              h2: ({ node, ...props }) => <h2 className="text-base font-semibold text-[#ffffff] mt-4 mb-2" {...props} />,
-              h3: ({ node, ...props }) => <h3 className="text-sm font-semibold text-[#ffffff] mt-3 mb-1.5" {...props} />,
-              p:  ({ node, ...props }) => <p  className="text-sm text-[#cccccc] mb-2" {...props} />,
+              h2: ({ node, ...props }) => (
+                <h2 className="flex items-center gap-2 text-base font-semibold text-[#ffffff] mt-5 mb-3" {...props}>
+                  <span className="inline-block w-1 h-4 rounded-full bg-[#007acc] shrink-0" />
+                  {(props as any).children}
+                </h2>
+              ),
+              h3: ({ node, ...props }) => <h3 className="text-sm font-semibold text-[#4ec9b0] mt-4 mb-2 uppercase tracking-wide text-[0.7rem]" {...props} />,
+              p:  ({ node, ...props }) => <p  className="text-sm text-[#c8c8c8] mb-3 leading-6" {...props} />,
               code: ({ node, inline, ...props }: any) => inline
-                ? <code className="px-1.5 py-0.5 bg-[#2d2d2d] text-[#d4d4d4] rounded text-xs font-mono" {...props} />
-                : <code className="block px-3 py-2 bg-[#1e1e1e] border border-[#2d2d2d] text-[#d4d4d4] rounded text-xs font-mono overflow-x-auto" {...props} />,
-              pre:    ({ node, ...props }) => <pre    className="mb-3 overflow-x-auto" {...props} />,
-              ul:     ({ node, ...props }) => <ul     className="text-sm text-[#cccccc] mb-2 list-disc list-inside" {...props} />,
-              ol:     ({ node, ...props }) => <ol     className="text-sm text-[#cccccc] mb-2 list-decimal list-inside" {...props} />,
+                ? <code className="px-1.5 py-0.5 bg-[#2a2a2a] border border-[#3c3c3c] text-[#ce9178] text-[0.85em] font-mono rounded" {...props} />
+                : <code className="block px-4 py-3 bg-[#141414] border border-[#2a2a2a] text-[#d4d4d4] text-xs font-mono overflow-x-auto leading-5" {...props} />,
+              pre:    ({ node, ...props }) => <pre    className="mb-4 overflow-x-auto rounded-md border border-[#2a2a2a] bg-[#141414]" {...props} />,
+              ul:     ({ node, ...props }) => <ul     className="text-sm text-[#c8c8c8] mb-3 space-y-1.5 pl-4 list-disc marker:text-[#007acc]" {...props} />,
+              ol:     ({ node, ...props }) => <ol     className="text-sm text-[#c8c8c8] mb-3 space-y-1.5 pl-4 list-decimal marker:text-[#007acc]" {...props} />,
+              li:     ({ node, ...props }) => <li     className="leading-6 pl-1" {...props} />,
               strong: ({ node, ...props }) => <strong className="text-[#ffffff] font-semibold" {...props} />,
+              blockquote: ({ node, ...props }) => <blockquote className="border-l-2 border-[#007acc] pl-3 text-[#b8b8b8] italic my-3 bg-[#1e2a33] py-2 rounded-r" {...props} />,
+              hr: ({ node, ...props }) => <hr className="my-5 border-[#2d2d2d]" {...props} />,
             }}>
               {analysisResult}
             </ReactMarkdown>

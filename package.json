@@ -17,6 +17,11 @@
         "command": "traceback.open",
         "title": "Open TraceBack Panel",
         "category": "TraceBack"
+      },
+      {
+        "command": "traceback.runFile",
+        "title": "Run with TraceBack",
+        "category": "TraceBack"
       }
     ],
     "configuration": {
