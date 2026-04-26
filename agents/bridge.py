@@ -20,6 +20,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
+from uuid import uuid4
 
 import certifi
 import uvicorn
@@ -162,7 +163,11 @@ def embed_text(text: str) -> list:
         return _normalize_vector(_gemini_embed(text=text, key=key))
     else:
         client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        resp = client.embeddings.create(model="text-embedding-3-small", input=text)
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+            dimensions=SCHEMA_EMBEDDING_DIM,
+        )
         return _normalize_vector(resp.data[0].embedding)
 
 
@@ -223,14 +228,50 @@ def _parse_file(file_path: str) -> List[_Chunk]:
     chunks: List[_Chunk] = []
     try:
         src = open(file_path, encoding="utf-8").read()
+    except Exception:
+        return chunks
+
+    try:
         tree = ast.parse(src)
         lines = src.splitlines()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 raw = "\n".join(lines[node.lineno - 1: node.end_lineno])
                 chunks.append(_Chunk(file_path, node.name, raw))
+        # Script-style files with no top-level defs → use whole file as one chunk
+        if not chunks:
+            chunks.append(_Chunk(file_path, "<module>", src))
+    except SyntaxError:
+        # Keep triage functional for files that currently fail to parse.
+        chunks.append(_Chunk(file_path, "<module_syntax_error>", src))
     except Exception:
-        pass
+        return chunks
+    return chunks
+
+
+def _parse_any_file(file_path: str) -> List[_Chunk]:
+    """
+    Parse Python files structurally; treat any other text-like file as line chunks.
+    This keeps fix generation usable across JS/TS/JSON/YAML/etc.
+    """
+    if file_path.endswith(".py"):
+        return _parse_file(file_path)
+
+    try:
+        src = open(file_path, encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return []
+    if not src.strip():
+        return []
+
+    lines = src.splitlines()
+    window = 120
+    chunks: List[_Chunk] = []
+    for i in range(0, max(1, len(lines)), window):
+        block = "\n".join(lines[i: i + window]) if lines else src
+        if not block.strip():
+            continue
+        chunks.append(_Chunk(file_path, f"<chunk_{(i // window) + 1}>", block))
     return chunks
 
 
@@ -308,6 +349,10 @@ class ReindexFileRequest(BaseModel):
 
 class FixRequest(BaseModel):
     error_log: str
+
+
+class FixCleanupRequest(BaseModel):
+    request_id: str
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -533,28 +578,14 @@ def reindex_file(req: ReindexFileRequest):
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
-    try:
-        embedding = embed_text(req.error_log)
-    except PermissionError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+    matches = _retrieve_relevant_chunks(req.error_log, match_count=8)
+    print(f"[Bridge] Analyze: {len(matches)} candidate chunks", flush=True)
 
-    try:
-        result = _get_supabase().rpc(
-            "match_code_chunks",
-            {"query_embedding": embedding, "match_count": 5},
-        ).execute()
-    except Exception as e:
-        raise _classify_supabase_error(e)
-
-    matches = result.data or []
     if not matches:
         return {
             "result": (
-                "No code indexed yet. Click **Index Workspace** first, then try again.\n\n"
-                "If you've already indexed, run `GET /health` to verify your Supabase "
-                "connection and schema setup."
+                "Could not find any readable Python files in the traceback. "
+                "Make sure the file paths in the error are accessible on this machine."
             )
         }
 
@@ -575,8 +606,8 @@ def analyze(req: AnalyzeRequest):
                         "Given an error log and the most relevant code blocks from a vector search, "
                         "produce an Incident Context Kit: identify the root cause, trace the exact "
                         "dependency chain, and suggest a precise fix. "
-                        "Use markdown with clear headers (## Root Cause, ## Dependency Chain, ## Fix). "
-                        "Be technical and concise."
+                        "Use plain text with clear section titles (Root Cause, Dependency Chain, Fix). "
+                        "Do not use markdown formatting, bold text, or code blocks. Be technical and concise."
                     ),
                 },
                 {
@@ -589,42 +620,224 @@ def analyze(req: AnalyzeRequest):
             ],
             max_tokens=1024,
         )
-        return {"result": synthesis.choices[0].message.content}
+        return {"result": synthesis.choices[0].message.content or ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ASI1 synthesis failed: {e}")
 
 
-@app.post("/fix")
-def fix_code(req: FixRequest):
-    try:
-        embedding = embed_text(req.error_log)
-    except PermissionError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+def _extract_traceback_files(error_log: str) -> List[str]:
+    """Return unique file paths mentioned in traceback/log formats."""
+    seen: dict = {}
+    patterns = [
+        r'File "([^"]+)"',                      # Python traceback
+        r'at ((?:/[^:\n]+)+):\d+(?::\d+)?',     # JS/TS stacktrace absolute paths
+        r'((?:/[^:\n]+)+\.[A-Za-z0-9_]+):\d+',  # Generic /path/file.ext:line
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, error_log):
+            fp = m.group(1).strip()
+            if fp in seen:
+                continue
+            seen[fp] = True
+    return list(seen)
+
+
+def _extract_failure_signals(error_log: str) -> Dict[str, List[str]]:
+    """
+    Parse failing files/functions from raw logs with an LLM-first strategy.
+    Falls back to regex extraction so the pipeline still works if the LLM fails.
+    """
+    fallback_files = _extract_traceback_files(error_log)
+    fallback_functions = re.findall(r"in ([A-Za-z_][A-Za-z0-9_]*)", error_log)
 
     try:
+        response = _get_asi1().chat.completions.create(
+            model="asi1",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract failing Python symbols from an error log. "
+                        "Extract failing symbols and file paths from an error log. "
+                        "Return JSON only with this exact schema: "
+                        '{"files": ["..."], "functions": ["..."]}. '
+                        "Include only real values found in the log. No markdown."
+                    ),
+                },
+                {"role": "user", "content": error_log},
+            ],
+            max_tokens=250,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"^```[a-z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        files = [f for f in parsed.get("files", []) if isinstance(f, str)]
+        functions = [f for f in parsed.get("functions", []) if isinstance(f, str)]
+        return {
+            "files": list(dict.fromkeys(files + fallback_files)),
+            "functions": list(dict.fromkeys(functions + fallback_functions)),
+        }
+    except Exception:
+        return {
+            "files": list(dict.fromkeys(fallback_files)),
+            "functions": list(dict.fromkeys(fallback_functions)),
+        }
+
+
+def _retrieve_relevant_chunks(error_log: str, match_count: int = 8) -> List[Dict[str, Any]]:
+    """
+    Embed extracted failure signals + raw log, then query Supabase pgvector RPC.
+    Returns rows shaped for the webview markdown renderer.
+    """
+    signals = _extract_failure_signals(error_log)
+    query_text = "\n".join(
+        [
+            f"error_log:\n{error_log}",
+            f"failing_files: {', '.join(signals['files'])}",
+            f"failing_functions: {', '.join(signals['functions'])}",
+        ]
+    )
+    fallback: List[Dict[str, Any]] = []
+    for fp in signals["files"]:
+        for chunk in _parse_file(fp):
+            fallback.append(
+                {
+                    "file_path": chunk.file_path,
+                    "function_name": chunk.function_name,
+                    "raw_code": chunk.raw_code,
+                    "similarity": 1.0,
+                }
+            )
+
+    matches: List[Dict[str, Any]] = []
+    try:
+        embedding = embed_text(query_text)
         result = _get_supabase().rpc(
             "match_code_chunks",
-            {"query_embedding": embedding, "match_count": 5},
+            {"query_embedding": embedding, "match_count": match_count},
         ).execute()
+        matches = result.data or []
     except Exception as e:
-        raise _classify_supabase_error(e)
+        # Keep incident triage usable even if vector infra is temporarily unavailable.
+        print(f"[Bridge] Vector retrieval unavailable, using traceback fallback: {e}", flush=True)
+        matches = []
 
-    matches = result.data or []
+    if matches and fallback:
+        # Prioritize exact traceback files, then enrich with semantic vector hits.
+        merged = fallback + matches
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for m in merged:
+            key = (m.get("file_path", ""), m.get("function_name", ""), m.get("raw_code", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(m)
+        return deduped
+
+    if matches:
+        return matches
+
+    if fallback:
+        return fallback
+
+    # Last-resort fallback: keep analysis functional even when file paths are
+    # inaccessible or unparsable by providing the raw incident payload as context.
+    function_hint = signals["functions"][0] if signals["functions"] else "<unknown>"
+    return [
+        {
+            "file_path": signals["files"][0] if signals["files"] else "<unresolved_path>",
+            "function_name": function_hint,
+            "raw_code": (
+                "# Raw incident log (file path could not be read on this machine)\n"
+                f"{error_log}"
+            ),
+            "similarity": 0.0,
+        }
+    ]
+
+
+def _stage_fix_chunks(file_paths: List[str], request_id: str) -> int:
+    """
+    Temporarily embed and insert chunks for files likely involved in the fix.
+    These staged chunks are cleaned up after apply via /fix-cleanup.
+    """
+    all_chunks: List[_Chunk] = []
+    for file_path in file_paths:
+        all_chunks.extend(_parse_any_file(file_path))
+
+    if not all_chunks:
+        return 0
+
+    sb = _get_supabase()
+    total = 0
+    batch_size = 20
+    for start in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[start: start + batch_size]
+        texts = [f"{c.file_path}::{c.function_name}\n{c.raw_code}" for c in batch]
+        embeddings = [embed_text(t) for t in texts]
+        rows = [
+            {
+                "request_id": request_id,
+                "file_path": batch[i].file_path,
+                "function_name": batch[i].function_name,
+                "raw_code": batch[i].raw_code,
+                "embedding": embeddings[i],
+            }
+            for i in range(len(batch))
+        ]
+        try:
+            sb.table("code_chunks").insert(rows).execute()
+        except Exception as e:
+            raise _classify_supabase_error(e)
+        total += len(rows)
+    return total
+
+
+def _is_edit_candidate_valid(file_path: str, old_code: str, new_code: str) -> bool:
+    """
+    Lightweight guardrails so we only return plausible edits.
+    """
+    if not new_code or not new_code.strip():
+        return False
+    if new_code.strip() == old_code.strip():
+        return False
+    if "```" in new_code:
+        return False
+    # Reject obviously destructive rewrites for function-level edits.
+    if old_code.strip() and len(new_code) > max(20000, len(old_code) * 5):
+        return False
+    if file_path.endswith(".py"):
+        try:
+            ast.parse(new_code)
+        except Exception:
+            return False
+    return True
+
+
+@app.post("/fix")
+def fix_code(req: FixRequest):
+    fix_request_id = f"fix:{uuid4()}"
+    signals = _extract_failure_signals(req.error_log)
+    staged_chunks = _stage_fix_chunks(signals["files"], fix_request_id)
+    print(f"[Bridge] Fix staging: {staged_chunks} chunks ({fix_request_id})", flush=True)
+
+    matches = _retrieve_relevant_chunks(req.error_log, match_count=8)
+    print(f"[Bridge] Fix: {len(matches)} candidate chunks", flush=True)
+
     if not matches:
-        return {"edits": [], "message": "No code indexed yet. Run Index Workspace first."}
+        return {
+            "edits": [],
+            "fix_request_id": fix_request_id,
+            "message": "Could not find any readable files in the traceback.",
+        }
 
+    # Number each block so the LLM identifies it by index — no fragile string matching.
     context_blocks = "\n\n".join(
-        f"File: {m['file_path']}\nFunction: {m['function_name']}\n```python\n{m['raw_code']}\n```"
-        for m in matches
+        f"[{i}] File: {m['file_path']}\nFunction: {m['function_name']}\n```python\n{m['raw_code']}\n```"
+        for i, m in enumerate(matches)
     )
-
-    # Keyed by (file_path, function_name) so we can resolve old_code exactly
-    # without relying on the LLM to reproduce verbatim text.
-    chunk_lookup: Dict[tuple, str] = {
-        (m["file_path"], m["function_name"]): m["raw_code"] for m in matches
-    }
 
     try:
         response = _get_asi1().chat.completions.create(
@@ -634,10 +847,9 @@ def fix_code(req: FixRequest):
                     "role": "system",
                     "content": (
                         "You are a senior engineer fixing a production bug. "
-                        "Given an error log and the relevant code blocks, return ONLY a JSON array of edits. "
-                        "Each edit must be an object with exactly three string fields: "
-                        '"file_path" (absolute path as shown above), '
-                        '"function_name" (exact function name as shown above), '
+                        "Given an error log and numbered code blocks, return ONLY a JSON array of edits. "
+                        "Each edit must be an object with exactly two fields: "
+                        '"block_index" (integer — the [N] number of the block to fix), '
                         '"new_code" (the complete fixed replacement for that function, preserving indentation exactly). '
                         "Return raw JSON only — no markdown fences, no prose, no explanation."
                     ),
@@ -646,7 +858,7 @@ def fix_code(req: FixRequest):
                     "role": "user",
                     "content": (
                         f"Error log:\n```\n{req.error_log}\n```\n\n"
-                        f"Relevant code:\n{context_blocks}"
+                        f"Relevant code blocks:\n{context_blocks}"
                     ),
                 },
             ],
@@ -659,30 +871,81 @@ def fix_code(req: FixRequest):
         if not isinstance(edits, list):
             edits = [edits]
 
-        # Resolve old_code from the exact stored source — never trust LLM for verbatim text
         full_edits = []
         for edit in edits:
-            fp = edit.get("file_path", "")
-            fn = edit.get("function_name", "")
+            idx = edit.get("block_index")
+            if idx is None:
+                idx = edit.get("index", edit.get("chunk_index"))
+            if isinstance(idx, str) and idx.isdigit():
+                idx = int(idx)
             new_code = edit.get("new_code", "")
-            if not fp or not new_code:
+            if idx is None or not new_code:
+                print(f"[Bridge] Fix: malformed edit {edit!r}", flush=True)
                 continue
-            old_code = chunk_lookup.get((fp, fn))
-            if old_code is None:
-                for (cfp, cfn), code in chunk_lookup.items():
-                    if cfp == fp and cfn.lower() == fn.lower():
-                        old_code = code
-                        break
-            if old_code is None:
-                print(f"[Bridge] Fix: could not find {fn!r} in {fp!r}", flush=True)
+            if not isinstance(idx, int) or not (0 <= idx < len(matches)):
+                print(f"[Bridge] Fix: block_index {idx!r} out of range", flush=True)
                 continue
-            full_edits.append({"file_path": fp, "old_code": old_code, "new_code": new_code})
+            m = matches[idx]
+            if not _is_edit_candidate_valid(m["file_path"], m["raw_code"], new_code):
+                print(f"[Bridge] Fix: rejected invalid edit for {m['file_path']}", flush=True)
+                continue
+            full_edits.append({
+                "file_path": m["file_path"],
+                "old_code": m["raw_code"],
+                "new_code": new_code,
+            })
 
-        return {"edits": full_edits}
+        if not full_edits:
+            # Recovery path for syntax-error incidents where the model may omit block_index.
+            first = matches[0]
+            fallback_response = _get_asi1().chat.completions.create(
+                model="asi1",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return ONLY the complete fixed replacement code for the provided Python block. "
+                            "Do not return JSON, markdown, or explanation."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Error log:\n{req.error_log}\n\n"
+                            f"Block to fix:\n```python\n{first['raw_code']}\n```"
+                        ),
+                    },
+                ],
+                max_tokens=2048,
+            )
+            raw_code = fallback_response.choices[0].message.content.strip()
+            raw_code = re.sub(r"^```[a-z]*\s*", "", raw_code)
+            raw_code = re.sub(r"\s*```$", "", raw_code)
+            if raw_code and _is_edit_candidate_valid(first["file_path"], first["raw_code"], raw_code):
+                full_edits.append(
+                    {
+                        "file_path": first["file_path"],
+                        "old_code": first["raw_code"],
+                        "new_code": raw_code,
+                    }
+                )
+
+        return {"edits": full_edits, "fix_request_id": fix_request_id}
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"LLM returned non-JSON: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fix generation failed: {e}")
+
+
+@app.post("/fix-cleanup")
+def cleanup_fix_chunks(req: FixCleanupRequest):
+    if not req.request_id.startswith("fix:"):
+        raise HTTPException(status_code=400, detail="Invalid fix request id")
+    try:
+        _get_supabase().table("code_chunks").delete().eq("request_id", req.request_id).execute()
+        return {"ok": True, "request_id": req.request_id}
+    except Exception as e:
+        raise _classify_supabase_error(e)
 
 
 if __name__ == "__main__":

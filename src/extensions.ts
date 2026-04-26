@@ -19,6 +19,7 @@ const ANSI_RE = /\x1b\[[0-9;]*[mGKHFJA-Z]/g;
 function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
 
 const TRACEBACK_RE = /Traceback \(most recent call last\)[\s\S]+?[\w.]+(?:Error|Exception):[ \t]*.+/;
+const TERMINAL_ERROR_FALLBACK_RE = /File "([^"]+)", line \d+[\s\S]{0,1200}?(?:[\w.]+(?:Error|Exception)|SyntaxError):[ \t]*.+/;
 
 // ── Post a message to the webview panel ───────────────────────────────────
 
@@ -147,7 +148,7 @@ function _findEditRange(doc: vscode.TextDocument, oldCode: string): vscode.Range
     return null;
 }
 
-async function applyFix(edits: FileEdit[], output: vscode.OutputChannel) {
+async function applyFix(edits: FileEdit[], output: vscode.OutputChannel, fixRequestId?: string) {
     if (!edits || edits.length === 0) {
         postToPanel({ type: 'fix-result', applied: 0, total: 0 });
         return;
@@ -174,6 +175,9 @@ async function applyFix(edits: FileEdit[], output: vscode.OutputChannel) {
 
     if (applied > 0) {
         await vscode.workspace.applyEdit(wsEdit);
+        if (fixRequestId) {
+            callBridgePost('/fix-cleanup', { request_id: fixRequestId }, output);
+        }
         const first = edits.find(e => {
             try { vscode.Uri.file(e.file_path); return true; } catch { return false; }
         });
@@ -216,32 +220,66 @@ function setupFileWatcher(context: vscode.ExtensionContext, output: vscode.Outpu
 // ── Terminal listener: capture Python tracebacks via shell integration ────
 
 function setupTerminalErrorCapture(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
-    const event = (vscode.window as any).onDidStartTerminalShellExecution;
-    if (typeof event !== 'function') {
-        output.appendLine('[TraceBack] Shell integration API unavailable; paste errors manually.');
-        return;
+    const captureFromBuffer = (buf: string, source: 'terminal' | 'run'): string | null => {
+        const match = buf.match(TRACEBACK_RE) ?? buf.match(TERMINAL_ERROR_FALLBACK_RE);
+        if (!match) return null;
+        const errorText = match[0].trim();
+        if (!errorText || errorText === latestCapturedError) return null;
+        latestCapturedError = errorText;
+        output.appendLine('[TraceBack] Error captured from terminal');
+        postToPanel({ type: 'error-captured', data: errorText, source });
+        return errorText;
+    };
+
+    try {
+        const event = (vscode.window as any).onDidStartTerminalShellExecution;
+        if (typeof event === 'function') {
+            context.subscriptions.push(
+                event(async (e: { execution: { read(): AsyncIterable<string> } }) => {
+                    const stream = e.execution.read();
+                    let buf = '';
+                    try {
+                        for await (const chunk of stream) {
+                            buf += stripAnsi(chunk).replace(/\r/g, '');
+                            if (buf.length > 16384) buf = buf.slice(buf.length - 16384);
+                            const captured = captureFromBuffer(buf, 'terminal');
+                            if (captured) {
+                                const idx = buf.indexOf(captured);
+                                if (idx >= 0) buf = buf.slice(idx + captured.length);
+                            }
+                        }
+                    } catch { /* stream ended or shell integration detached */ }
+                })
+            );
+        } else {
+            output.appendLine('[TraceBack] Shell integration stream unavailable; using write-data fallback.');
+        }
+    } catch (e: any) {
+        output.appendLine(`[TraceBack] Shell integration hook failed: ${e.message}`);
     }
 
-    context.subscriptions.push(
-        event(async (e: { execution: { read(): AsyncIterable<string> } }) => {
-            const stream = e.execution.read();
-            let buf = '';
-            try {
-                for await (const chunk of stream) {
-                    buf += stripAnsi(chunk).replace(/\r/g, '');
-                    if (buf.length > 8192) buf = buf.slice(buf.length - 8192);
-                    const match = buf.match(TRACEBACK_RE);
-                    if (match) {
-                        const errorText = match[0].trim();
-                        buf = buf.slice(buf.indexOf(match[0]) + match[0].length);
-                        latestCapturedError = errorText;
-                        output.appendLine('[TraceBack] Error captured from terminal');
-                        postToPanel({ type: 'error-captured', data: errorText, source: 'terminal' });
+    // Fallback path: captures terminal write events (works when shell integration misses output).
+    try {
+        const writeEvent = (vscode.window as any).onDidWriteTerminalData;
+        if (typeof writeEvent === 'function') {
+            const buffers = new Map<string, string>();
+            context.subscriptions.push(
+                writeEvent((e: { terminal?: { name?: string }; data?: string }) => {
+                    const key = e?.terminal?.name ?? 'default';
+                    const prev = buffers.get(key) ?? '';
+                    const next = (prev + stripAnsi(e?.data ?? '').replace(/\r/g, '')).slice(-16384);
+                    buffers.set(key, next);
+                    const captured = captureFromBuffer(next, 'terminal');
+                    if (captured) {
+                        const idx = next.indexOf(captured);
+                        if (idx >= 0) buffers.set(key, next.slice(idx + captured.length));
                     }
-                }
-            } catch { /* stream ended or shell integration detached */ }
-        })
-    );
+                })
+            );
+        }
+    } catch (e: any) {
+        output.appendLine(`[TraceBack] Terminal write fallback hook failed: ${e.message}`);
+    }
 }
 
 // ── Activation ────────────────────────────────────────────────────────────
@@ -267,13 +305,81 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     setupFileWatcher(context, output);
-    setupTerminalErrorCapture(context, output);
+    try {
+        setupTerminalErrorCapture(context, output);
+    } catch (e: any) {
+        output.appendLine(`[TraceBack] Terminal capture disabled: ${e.message}`);
+    }
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('traceback.open', () => openPanel(context, output))
+        vscode.commands.registerCommand('traceback.open', () => openPanel(context, output)),
+        vscode.commands.registerCommand('traceback.runFile', () => runActiveFile(context, output))
     );
 
+    // Status bar "Run with TraceBack" button — visible when a Python file is active
+    const runBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    runBtn.command = 'traceback.runFile';
+    runBtn.text = '$(play) Run with TraceBack';
+    runBtn.tooltip = 'Run the active Python file and capture any errors';
+    context.subscriptions.push(runBtn);
+    const refreshBtn = () => {
+        if (vscode.window.activeTextEditor?.document.fileName.endsWith('.py')) {
+            runBtn.show();
+        } else {
+            runBtn.hide();
+        }
+    };
+    refreshBtn();
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(refreshBtn));
+
     openPanel(context, output);
+}
+
+function runActiveFile(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || !editor.document.fileName.endsWith('.py')) {
+        vscode.window.showErrorMessage('Open a Python file to run with TraceBack.');
+        return;
+    }
+
+    const filePath = editor.document.fileName;
+    const config = vscode.workspace.getConfiguration('traceback');
+    const pythonPath = config.get<string>('pythonPath', 'python3');
+
+    output.appendLine(`[TraceBack] Running ${filePath}`);
+    openPanel(context, output);
+    postToPanel({ type: 'run-start', file: path.basename(filePath) });
+
+    const proc = spawn(pythonPath, [filePath], { cwd: path.dirname(filePath) });
+
+    let combined = '';
+    const onData = (d: Buffer) => {
+        const text = stripAnsi(d.toString()).replace(/\r/g, '');
+        combined += text;
+        if (combined.length > 16384) { combined = combined.slice(combined.length - 16384); }
+    };
+    proc.stdout?.on('data', onData);
+    proc.stderr?.on('data', onData);
+
+    proc.on('exit', code => {
+        output.appendLine(`[TraceBack] ${path.basename(filePath)} exited (code ${code})`);
+        const match = combined.match(TRACEBACK_RE);
+        if (match) {
+            const errorText = match[0].trim();
+            latestCapturedError = errorText;
+            output.appendLine('[TraceBack] Error captured from run');
+            postToPanel({ type: 'error-captured', data: errorText, source: 'run' });
+        } else if (code !== 0) {
+            postToPanel({ type: 'run-error', output: combined.slice(-2000) });
+        } else {
+            postToPanel({ type: 'run-ok', file: path.basename(filePath) });
+        }
+    });
+
+    proc.on('error', (e: Error) => {
+        output.appendLine(`[TraceBack] Failed to run: ${e.message}`);
+        vscode.window.showErrorMessage(`TraceBack: failed to run — ${e.message}`);
+    });
 }
 
 function startBridge(context: vscode.ExtensionContext, output: vscode.OutputChannel, port: number) {
@@ -329,7 +435,7 @@ function openPanel(context: vscode.ExtensionContext, output: vscode.OutputChanne
     activePanel.webview.onDidReceiveMessage(
         async (msg: any) => {
             if (msg.type === 'apply-fix') {
-                await applyFix(msg.edits ?? [], output);
+                await applyFix(msg.edits ?? [], output, msg.fix_request_id);
             } else if (msg.type === 'bridge-call') {
                 handleBridgeCall(msg.id, msg.method, msg.path, msg.body, output);
             }
