@@ -4,9 +4,7 @@ from dataclasses import dataclass, asdict
 from typing import List
 
 
-# =========================
-# Data मॉडल (Protocol Match)
-# =========================
+
 @dataclass
 class CodeChunk:
     file_path: str
@@ -14,9 +12,7 @@ class CodeChunk:
     raw_code: str
 
 
-# =========================
-# AST Parser Core
-# =========================
+
 class RepoParser:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -52,7 +48,7 @@ class RepoParser:
     def _extract_chunk(self, node, source: str, file_path: str):
         """Extract exact source code for a node."""
         try:
-            # Python 3.8+ has end_lineno
+
             start = node.lineno - 1
             end = node.end_lineno
 
@@ -69,9 +65,7 @@ class RepoParser:
             return None
 
 
-# =========================
-# Agent 1 Wrapper (Stub for uAgents)
-# =========================
+
 class Agent1Parser:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -82,7 +76,7 @@ class Agent1Parser:
 
         print(f"[Agent 1] Extracted {len(chunks)} code chunks")
 
-        # 🔗 This is where you'd send to Agent 2
+
         self.send_to_agent2(chunks)
 
     def send_to_agent2(self, chunks: List[CodeChunk]):
@@ -95,9 +89,6 @@ class Agent1Parser:
             print(payload)
 
 
-# =========================
-# Run Script
-# =========================
 if __name__ == "__main__":
     repo_path = "./dummy_repo"  # change this
     agent = Agent1Parser(repo_path)
